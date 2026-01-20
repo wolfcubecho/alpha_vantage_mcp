@@ -1,0 +1,391 @@
+"""Alpha Equities tools: macro snapshot, symbol snapshot, and discovery.
+
+Mirrors functionality from the Node MCP implementation with conservative
+request patterns, Alpha Vantage as primary data source, and Yahoo Finance
+fallbacks when AV is unavailable or rate-limited.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from src.tools.registry import tool
+from src.common import _make_api_request
+
+
+# Yahoo Finance helpers (no key required)
+def _yf_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
+    """Get Yahoo Finance quote for a symbol.
+
+    Returns:
+        Dict with price, pctChange, volume or None on error.
+    """
+    try:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote"
+        params = {"symbols": symbol}
+        with httpx.Client(timeout=10) as client:
+            res = client.get(url, params=params)
+            if res.status_code != 200:
+                return None
+            json = res.json()
+        arr = (json.get("quoteResponse", {}) or {}).get("result", [])
+        q = arr[0] if arr else None
+        if not q:
+            return None
+        price = q.get("regularMarketPrice")
+        pct = q.get("regularMarketChangePercent")
+        vol = q.get("regularMarketVolume")
+        return {
+            "price": float(price) if isinstance(price, (int, float)) else None,
+            "pctChange": float(pct) if isinstance(pct, (int, float)) else None,
+            "volume": float(vol) if isinstance(vol, (int, float)) else None,
+        }
+    except Exception:
+        return None
+
+
+def _yf_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
+    """Get Yahoo Finance daily candles for symbol (2y range, 1d interval)."""
+    try:
+        base = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {"range": "2y", "interval": "1d"}
+        with httpx.Client(timeout=10) as client:
+            res = client.get(base, params=params)
+            if res.status_code != 200:
+                return None
+            data = res.json()
+        result = ((data or {}).get("chart", {}) or {}).get("result", [])
+        if not result:
+            return None
+        quote = (result[0].get("indicators", {}) or {}).get("quote", [])
+        q0 = quote[0] if quote else {}
+        closes = [float(v) for v in (q0.get("close") or []) if isinstance(v, (int, float))]
+        highs = [float(v) for v in (q0.get("high") or []) if isinstance(v, (int, float))]
+        lows = [float(v) for v in (q0.get("low") or []) if isinstance(v, (int, float))]
+        if not closes:
+            return None
+        return {"closes": closes, "highs": highs, "lows": lows}
+    except Exception:
+        return None
+
+
+def _ema(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+def _rma(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    s = sum(values[:period])
+    v = s / period
+    a = 1 / period
+    for x in values[period:]:
+        v = a * x + (1 - a) * v
+    return v
+
+
+@tool
+def macro_snapshot(
+    symbols: Optional[str] = None,
+    includeSector: Optional[str] = None,
+    includeMovers: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Efficient macro snapshot with optional sector and movers.
+
+    Args:
+        symbols: Comma-separated macro tickers; default SPY,VIX,UUP (limit ~3)
+        includeSector: Include sector performance ("true"/"false")
+        includeMovers: Include top gainers/losers ("true"/"false")
+    Returns:
+        Dict containing sector, movers, and per-symbol snapshot (price, pctChange, volume).
+    """
+    syms = (symbols or "SPY,VIX,UUP").split(",")
+    syms = [s.strip() for s in syms if s.strip()][:3]
+    want_sector = (includeSector or "false").lower() == "true"
+    want_movers = (includeMovers or "false").lower() == "true"
+
+    sector = _make_api_request("SECTOR", {"datatype": "json"}) if want_sector else None
+    movers = _make_api_request("TOP_GAINERS_LOSERS", {"datatype": "json"}) if want_movers else None
+
+    out: List[Dict[str, Optional[float]]] = []
+    for sym in syms:
+        try:
+            cand = ["VIX", "VIXY"] if sym.upper() == "VIX" else [sym]
+            used = sym
+            # Try Alpha Vantage GLOBAL_QUOTE first with VIX→VIXY fallback
+            quote_json = None
+            for s in cand:
+                q = _make_api_request("GLOBAL_QUOTE", {"symbol": s, "datatype": "json"})
+                qq = (q or {}).get("Global Quote") if isinstance(q, dict) else None
+                price = float(qq.get("05. price")) if qq and qq.get("05. price") else None
+                if price and not math.isnan(price):
+                    quote_json = qq
+                    used = s
+                    break
+            price = None
+            pct = None
+            vol = None
+            if quote_json:
+                try:
+                    price = float(quote_json.get("05. price"))
+                except Exception:
+                    price = None
+                try:
+                    pct_str = (quote_json.get("10. change percent") or "0").replace("%", "")
+                    pct = float(pct_str)
+                except Exception:
+                    pct = None
+                try:
+                    vol = float(quote_json.get("06. volume"))
+                except Exception:
+                    vol = None
+            if price is None:
+                yq = _yf_quote(used)
+                if yq:
+                    price = yq.get("price")
+                    pct = yq.get("pctChange")
+                    vol = yq.get("volume")
+            out.append({"symbol": used, "price": price, "pctChange": pct, "volume": vol})
+        except Exception:
+            out.append({"symbol": sym, "price": None, "pctChange": None, "volume": None})
+
+    return {"sector": sector, "movers": movers, "etfs": out}
+
+
+@tool
+def symbol_snapshot(
+    symbol: str,
+    outputsize: Optional[str] = None,
+    atrPctMax: Optional[str] = None,
+    trendFilter: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Per-symbol snapshot: EMA(50/200), ATR% (14), latest quote.
+
+    Args:
+        symbol: Equity/ETF symbol, e.g., AAPL or SPY
+        outputsize: Alpha Vantage output size: compact|full (default compact)
+        atrPctMax: Max ATR% filter hint
+        trendFilter: Trend filter hint: up|down
+    Returns:
+        Dict with symbol metrics and filter hints.
+    """
+    outsize = outputsize or "compact"
+
+    daily = _make_api_request(
+        "TIME_SERIES_DAILY_ADJUSTED", {"symbol": symbol, "outputsize": outsize, "datatype": "json"}
+    )
+    series = daily.get("Time Series (Daily)") if isinstance(daily, dict) else {}
+    dates = sorted(series.keys()) if series else []
+    closes = [float(series[d]["5. adjusted close"]) for d in dates] if dates else []
+    highs = [float(series[d]["2. high"]) for d in dates] if dates else []
+    lows = [float(series[d]["3. low"]) for d in dates] if dates else []
+    if not closes:
+        fallback_sym = "VIXY" if symbol.upper() == "VIX" else symbol
+        yf = _yf_daily(fallback_sym)
+        if yf:
+            closes = yf["closes"]
+            highs = yf["highs"]
+            lows = yf["lows"]
+
+    last_close = closes[-1] if closes else None
+    tr: List[float] = []
+    for i in range(len(closes)):
+        hl = (highs[i] if i < len(highs) else 0.0) - (lows[i] if i < len(lows) else 0.0)
+        hc = abs((highs[i] if i < len(highs) else 0.0) - (closes[i - 1] if i > 0 else 0.0)) if i > 0 else 0.0
+        lc = abs((lows[i] if i < len(lows) else 0.0) - (closes[i - 1] if i > 0 else 0.0)) if i > 0 else 0.0
+        tr.append(max(hl, hc, lc))
+
+    atr = _rma(tr, 14)
+    atr_pct = (atr / last_close * 100.0) if (atr is not None and last_close) else None
+    ema50 = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+    trend: Optional[str] = None
+    if ema50 is not None and ema200 is not None:
+        trend = "up" if ema50 > ema200 else "down"
+
+    atr_cap = float(atrPctMax) if atrPctMax else None
+    trend_pref = (trendFilter or "").lower() or None
+    hint = {
+        "atrPctUnderCap": (atr_cap is not None and atr_pct is not None and atr_pct <= atr_cap) or None,
+        "trendMatches": (trend_pref == trend) if trend_pref else None,
+    }
+
+    pct_change: Optional[float] = None
+    volume: Optional[float] = None
+    quote = _make_api_request("GLOBAL_QUOTE", {"symbol": symbol, "datatype": "json"})
+    q = quote.get("Global Quote") if isinstance(quote, dict) else None
+    if q:
+        try:
+            pct_str = (q.get("10. change percent") or "0").replace("%", "")
+            pct_change = float(pct_str)
+        except Exception:
+            pct_change = None
+        try:
+            volume = float(q.get("06. volume"))
+        except Exception:
+            volume = None
+    else:
+        yq = _yf_quote(symbol)
+        if yq:
+            pct_change = yq.get("pctChange")
+            volume = yq.get("volume")
+
+    return {
+        "symbol": symbol,
+        "price": last_close,
+        "pctChange": pct_change,
+        "volume": volume,
+        "atrPct": atr_pct,
+        "trend": trend,
+        "ema50": ema50,
+        "ema200": ema200,
+        "hint": hint,
+    }
+
+
+@tool
+def discover_equities(
+    source: Optional[str] = None,
+    topN: Optional[str] = None,
+    resultCount: Optional[str] = None,
+    maxSymbols: Optional[str] = None,
+    computeVolatility: Optional[str] = None,
+    outputsize: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Discover top equities from Alpha Vantage movers with ranking.
+
+    Args:
+        source: combined|gainers|losers|most_active (default: combined)
+        topN: Number of candidates from source lists (default: 10)
+        resultCount: Number of results to return (default: 5)
+        maxSymbols: Max symbols to quote (default: 4)
+        computeVolatility: Compute ATR% for finalists only: true|false (default: false)
+        outputsize: Daily series size if computing volatility: compact|full (default compact)
+    Returns:
+        Ranked list of dicts with symbol, price, pctChange, volume, and optional atrPct.
+    """
+    src = (source or "combined").lower()
+    n_top = int(topN or "10")
+    n_out = int(resultCount or "5")
+    max_sym = int(maxSymbols or "4")
+    want_vol = ((computeVolatility or "false").lower() == "true")
+    outsize = outputsize or "compact"
+
+    movers = _make_api_request("TOP_GAINERS_LOSERS", {"datatype": "json"})
+    bucket = {
+        "gainers": movers.get("top_gainers", []) if isinstance(movers, dict) else [],
+        "losers": movers.get("top_losers", []) if isinstance(movers, dict) else [],
+        "most_active": movers.get("most_actively_traded", []) if isinstance(movers, dict) else [],
+    }
+
+    if src == "gainers":
+        tickers = [x.get("ticker") for x in bucket["gainers"]]
+    elif src == "losers":
+        tickers = [x.get("ticker") for x in bucket["losers"]]
+    elif src == "most_active":
+        tickers = [x.get("ticker") for x in bucket["most_active"]]
+    else:
+        tickers = [x.get("ticker") for x in (bucket["gainers"] + bucket["most_active"])]
+
+    uniq = []
+    seen = set()
+    for t in tickers:
+        if not t:
+            continue
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+        if len(uniq) >= n_top:
+            break
+
+    # Quote up to max_sym, prefer Yahoo to avoid AV caps
+    to_quote = uniq[: max(1, max_sym)]
+    quotes: List[Dict[str, Optional[float]]] = []
+    for sym in to_quote:
+        price = None
+        pct = None
+        vol = None
+        yq = _yf_quote(sym)
+        if yq and yq.get("price") is not None:
+            price = yq.get("price")
+            pct = yq.get("pctChange")
+            vol = yq.get("volume")
+        else:
+            qres = _make_api_request("GLOBAL_QUOTE", {"symbol": sym, "datatype": "json"})
+            q = qres.get("Global Quote") if isinstance(qres, dict) else None
+            if q:
+                try:
+                    price = float(q.get("05. price"))
+                except Exception:
+                    price = None
+                try:
+                    pct_str = (q.get("10. change percent") or "0").replace("%", "")
+                    pct = float(pct_str)
+                except Exception:
+                    pct = None
+                try:
+                    vol = float(q.get("06. volume"))
+                except Exception:
+                    vol = None
+        quotes.append({"symbol": sym, "price": price, "pctChange": pct, "volume": vol})
+
+    # Rank by abs pctChange then volume
+    def _rank_key(x: Dict[str, Optional[float]]):
+        ma = abs(x.get("pctChange") or 0.0)
+        va = x.get("volume") or 0.0
+        return (-ma, -va)
+
+    quotes.sort(key=_rank_key)
+    out = [{**x, "atrPct": None} for x in quotes[:n_out]]
+
+    if want_vol:
+        for i in range(len(out)):
+            sym = out[i]["symbol"]
+            try:
+                daily = _make_api_request(
+                    "TIME_SERIES_DAILY_ADJUSTED",
+                    {"symbol": sym, "outputsize": outsize, "datatype": "json"},
+                )
+                series = daily.get("Time Series (Daily)") if isinstance(daily, dict) else {}
+                dates = sorted(series.keys()) if series else []
+                closes = [float(series[d]["5. adjusted close"]) for d in dates] if dates else []
+                highs = [float(series[d]["2. high"]) for d in dates] if dates else []
+                lows = [float(series[d]["3. low"]) for d in dates] if dates else []
+                if not closes:
+                    yf = _yf_daily(sym)
+                    if yf:
+                        closes = yf["closes"]
+                        highs = yf["highs"]
+                        lows = yf["lows"]
+                last_close = closes[-1] if closes else None
+                tr: List[float] = []
+                for j in range(len(closes)):
+                    hl = (highs[j] if j < len(highs) else 0.0) - (lows[j] if j < len(lows) else 0.0)
+                    hc = abs((highs[j] if j < len(highs) else 0.0) - (closes[j - 1] if j > 0 else 0.0)) if j > 0 else 0.0
+                    lc = abs((lows[j] if j < len(lows) else 0.0) - (closes[j - 1] if j > 0 else 0.0)) if j > 0 else 0.0
+                    tr.append(max(hl, hc, lc))
+                atr = _rma(tr, 14)
+                out[i]["atrPct"] = (atr / last_close * 100.0) if (atr is not None and last_close) else None
+            except Exception:
+                out[i]["atrPct"] = None
+
+        # After pctChange/volume, prefer lower ATR%
+        def _sort_key(x: Dict[str, Any]):
+            atr = x.get("atrPct")
+            atr_key = atr if isinstance(atr, (int, float)) else float("inf")
+            ma = abs(x.get("pctChange") or 0.0)
+            va = x.get("volume") or 0.0
+            return (atr_key, -ma, -va)
+
+        out.sort(key=_sort_key)
+
+    return out

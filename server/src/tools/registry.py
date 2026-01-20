@@ -3,6 +3,7 @@ TOOL_MODULES = {
     "core_stock_apis": "src.tools.core_stock_apis",
     "options_data_apis": "src.tools.options_data_apis",
     "alpha_intelligence": "src.tools.alpha_intelligence",
+    "alpha_equities": "src.tools.alpha_equities",
     "commodities": "src.tools.commodities",
     "cryptocurrencies": "src.tools.cryptocurrencies",
     "economic_indicators": "src.tools.economic_indicators",
