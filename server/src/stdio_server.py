@@ -29,8 +29,13 @@ import mcp.types as types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
-from .context import set_api_key
-from .tools.meta_tools import tool_list, tool_get, tool_call
+try:
+    from .context import set_api_key
+    from .tools.meta_tools import tool_list, tool_get, tool_call
+except ImportError:
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    from src.context import set_api_key
+    from src.tools.meta_tools import tool_list, tool_get, tool_call
 
 
 # Meta-tool definitions for progressive discovery
