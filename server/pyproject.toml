@@ -10,7 +10,6 @@ dependencies = [
     "loguru>=0.7.3",
     "mcp>=1.12.3",
     "python-dotenv>=1.1.1",
-    "yfinance>=0.2.30",
 ]
 
 [project.scripts]

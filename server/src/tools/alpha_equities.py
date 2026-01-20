@@ -11,132 +11,11 @@ import math
 import time
 from typing import Any, Dict, List, Optional
 
-import httpx
-try:
-    import yfinance as yf  # optional, improves Yahoo reliability
-    _HAS_YF = True
-except Exception:
-    _HAS_YF = False
-
 from src.tools.registry import tool
 from src.common import _make_api_request
 
 
-# Yahoo Finance helpers (no key required)
-def _yf_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
-    """Get Yahoo Finance quote for a symbol.
-
-    Returns:
-        Dict with price, pctChange, volume or None on error.
-    """
-    try:
-        url = "https://query1.finance.yahoo.com/v7/finance/quote"
-        params = {"symbols": symbol}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json",
-        }
-        with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
-            for _ in range(3):
-                res = client.get(url, params=params)
-                if res.status_code == 200:
-                    try:
-                        json = res.json()
-                        arr = (json.get("quoteResponse", {}) or {}).get("result", [])
-                        q = arr[0] if arr else None
-                        if not q:
-                            raise ValueError("empty quote result")
-                        price = q.get("regularMarketPrice")
-                        pct = q.get("regularMarketChangePercent")
-                        vol = q.get("regularMarketVolume")
-                        return {
-                            "price": float(price) if isinstance(price, (int, float)) else None,
-                            "pctChange": float(pct) if isinstance(pct, (int, float)) else None,
-                            "volume": float(vol) if isinstance(vol, (int, float)) else None,
-                        }
-                    except Exception:
-                        pass
-                time.sleep(0.3)
-        return None
-    except Exception:
-        return None
-
-
-def _yf_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
-    """Get Yahoo Finance daily candles for symbol (2y range, 1d interval)."""
-    try:
-        base = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {"range": "2y", "interval": "1d"}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json",
-        }
-        with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
-            for _ in range(3):
-                res = client.get(base, params=params)
-                if res.status_code == 200:
-                    try:
-                        data = res.json()
-                        result = ((data or {}).get("chart", {}) or {}).get("result", [])
-                        if not result:
-                            raise ValueError("empty chart result")
-                        quote = (result[0].get("indicators", {}) or {}).get("quote", [])
-                        q0 = quote[0] if quote else {}
-                        closes = [float(v) for v in (q0.get("close") or []) if isinstance(v, (int, float))]
-                        highs = [float(v) for v in (q0.get("high") or []) if isinstance(v, (int, float))]
-                        lows = [float(v) for v in (q0.get("low") or []) if isinstance(v, (int, float))]
-                        if not closes:
-                            raise ValueError("no closes")
-                        return {"closes": closes, "highs": highs, "lows": lows}
-                    except Exception:
-                        pass
-                time.sleep(0.3)
-        return None
-    except Exception:
-        return None
-
-
-def _yfi_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
-    """Quote via yfinance (robust Yahoo wrapper). Computes pctChange from history.
-
-    Returns price, pctChange, volume when available.
-    """
-    if not _HAS_YF:
-        return None
-    try:
-        df = yf.download(symbol, period="5d", interval="1d", progress=False)
-        if df is None or df.empty:
-            return None
-        last = df.tail(1)
-        prev = df.tail(2).head(1)
-        price = float(last["Close"].to_numpy()[0]) if "Close" in last.columns else None
-        volume = float(last["Volume"].to_numpy()[0]) if "Volume" in last.columns else None
-        pct = None
-        if price is not None and not prev.empty and "Close" in prev.columns:
-            prev_close = float(prev["Close"].to_numpy()[0])
-            if prev_close:
-                pct = (price - prev_close) / prev_close * 100.0
-        return {"price": price, "pctChange": pct, "volume": volume}
-    except Exception:
-        return None
-
-
-def _yfi_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
-    """Daily candles via yfinance (2y, 1d)."""
-    if not _HAS_YF:
-        return None
-    try:
-        df = yf.download(symbol, period="2y", interval="1d", progress=False)
-        if df is None or df.empty:
-            return None
-        closes = [float(x) for x in df["Close"].tolist()] if "Close" in df.columns else []
-        highs = [float(x) for x in df["High"].tolist()] if "High" in df.columns else []
-        lows = [float(x) for x in df["Low"].tolist()] if "Low" in df.columns else []
-        if not closes:
-            return None
-        return {"closes": closes, "highs": highs, "lows": lows}
-    except Exception:
-        return None
+# (Yahoo/yfinance helpers removed per Alpha-only requirement)
 
 
 def _ema(values: List[float], period: int) -> Optional[float]:
@@ -249,47 +128,33 @@ def symbol_snapshot(
         Dict with symbol metrics and filter hints.
     """
     outsize = outputsize or "compact"
-
-    # Prefer Yahoo/yfinance for all symbols; AV as last resort (skip AV for VIX)
+    # Alpha-only daily: use VIXY proxy for VIX
     vix_like = symbol.upper() in ("VIX", "^VIX")
+    daily_symbol = "VIXY" if vix_like else symbol
     closes: List[float] = []
     highs: List[float] = []
     lows: List[float] = []
 
-    # direct Yahoo first
-    for fs in (["^VIX", "VIXY"] if vix_like else [symbol]):
-        yf = _yf_daily(fs)
-        if yf:
-            closes = yf["closes"]
-            highs = yf["highs"]
-            lows = yf["lows"]
-            break
+    daily = _make_api_request(
+        "TIME_SERIES_DAILY_ADJUSTED", {"symbol": daily_symbol, "outputsize": outsize, "datatype": "json"}
+    )
+    series = daily.get("Time Series (Daily)") if isinstance(daily, dict) else {}
+    dates = sorted(series.keys()) if series else []
+    if dates:
+        closes = [float(series[d]["5. adjusted close"]) for d in dates]
+        highs = [float(series[d]["2. high"]) for d in dates]
+        lows = [float(series[d]["3. low"]) for d in dates]
 
-    # yfinance next
+    # If still no candles, use AV quote price
     if not closes:
-        yfd = (_yfi_daily("^VIX") or _yfi_daily("VIXY")) if vix_like else _yfi_daily(symbol)
-        if yfd:
-            closes = yfd["closes"]
-            highs = yfd["highs"]
-            lows = yfd["lows"]
-
-    # Alpha Vantage last (non-VIX only)
-    if not closes and not vix_like:
-        daily = _make_api_request(
-            "TIME_SERIES_DAILY_ADJUSTED", {"symbol": symbol, "outputsize": outsize, "datatype": "json"}
-        )
-        series = daily.get("Time Series (Daily)") if isinstance(daily, dict) else {}
-        dates = sorted(series.keys()) if series else []
-        if dates:
-            closes = [float(series[d]["5. adjusted close"]) for d in dates]
-            highs = [float(series[d]["2. high"]) for d in dates]
-            lows = [float(series[d]["3. low"]) for d in dates]
-
-    # If still no candles, use latest Yahoo/yfinance quote for last price
-    if not closes:
-        yq = (_yfi_quote("^VIX") or _yf_quote("^VIX") or _yfi_quote("VIXY") or _yf_quote("VIXY")) if vix_like else (_yfi_quote(symbol) or _yf_quote(symbol))
-        if yq and isinstance(yq.get("price"), (int, float)):
-            closes = [float(yq.get("price"))]
+        q = _make_api_request("GLOBAL_QUOTE", {"symbol": daily_symbol, "datatype": "json"})
+        gq = q.get("Global Quote") if isinstance(q, dict) else None
+        if gq:
+            try:
+                price_val = float(gq.get("05. price"))
+                closes = [price_val]
+            except Exception:
+                pass
 
     last_close = closes[-1] if closes else None
     tr: List[float] = []
@@ -316,27 +181,19 @@ def symbol_snapshot(
 
     pct_change: Optional[float] = None
     volume: Optional[float] = None
-    # Yahoo/yfinance first
-    for yf_sym in (["^VIX", "VIXY"] if vix_like else [symbol]):
-        yq = _yfi_quote(yf_sym) or _yf_quote(yf_sym)
-        if yq:
-            pct_change = yq.get("pctChange")
-            volume = yq.get("volume")
-            break
-    # Alpha Vantage fallback for non-VIX
-    if pct_change is None and not vix_like:
-        quote = _make_api_request("GLOBAL_QUOTE", {"symbol": symbol, "datatype": "json"})
-        q = quote.get("Global Quote") if isinstance(quote, dict) else None
-        if q:
-            try:
-                pct_str = (q.get("10. change percent") or "0").replace("%", "")
-                pct_change = float(pct_str)
-            except Exception:
-                pct_change = None
-            try:
-                volume = float(q.get("06. volume"))
-            except Exception:
-                volume = None
+    # Alpha Vantage quote (use VIXY for VIX)
+    quote = _make_api_request("GLOBAL_QUOTE", {"symbol": daily_symbol, "datatype": "json"})
+    q = quote.get("Global Quote") if isinstance(quote, dict) else None
+    if q:
+        try:
+            pct_str = (q.get("10. change percent") or "0").replace("%", "")
+            pct_change = float(pct_str)
+        except Exception:
+            pct_change = None
+        try:
+            volume = float(q.get("06. volume"))
+        except Exception:
+            volume = None
 
     result = {
         "symbol": symbol,
