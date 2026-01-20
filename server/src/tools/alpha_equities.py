@@ -149,13 +149,15 @@ def macro_snapshot(
                 except Exception:
                     vol = None
             if price is None:
-                # Yahoo fallback; for VIX, prefer VIXY which tracks VIX
-                yf_symbol = "VIXY" if sym.upper() == "VIX" else used
-                yq = _yf_quote(yf_symbol)
-                if yq:
-                    price = yq.get("price")
-                    pct = yq.get("pctChange")
-                    vol = yq.get("volume")
+                # Yahoo fallback; for VIX, try VIXY then ^VIX
+                yf_symbols = ["VIXY", "^VIX"] if sym.upper() == "VIX" else [used]
+                for yf_sym in yf_symbols:
+                    yq = _yf_quote(yf_sym)
+                    if yq:
+                        price = yq.get("price")
+                        pct = yq.get("pctChange")
+                        vol = yq.get("volume")
+                        break
             out.append({"symbol": used, "price": price, "pctChange": pct, "volume": vol})
         except Exception:
             out.append({"symbol": sym, "price": None, "pctChange": None, "volume": None})
@@ -191,12 +193,20 @@ def symbol_snapshot(
     highs = [float(series[d]["2. high"]) for d in dates] if dates else []
     lows = [float(series[d]["3. low"]) for d in dates] if dates else []
     if not closes:
-        fallback_sym = "VIXY" if symbol.upper() == "VIX" else symbol
-        yf = _yf_daily(fallback_sym)
-        if yf:
-            closes = yf["closes"]
-            highs = yf["highs"]
-            lows = yf["lows"]
+        # Try Yahoo daily candles for VIX via VIXY or ^VIX; else the same symbol
+        fallback_syms = ["VIXY", "^VIX"] if symbol.upper() == "VIX" else [symbol]
+        for fs in fallback_syms:
+            yf = _yf_daily(fs)
+            if yf:
+                closes = yf["closes"]
+                highs = yf["highs"]
+                lows = yf["lows"]
+                break
+        # If still no candles, at least use Yahoo quote for last price
+        if not closes:
+            yq = _yf_quote(fallback_syms[0])
+            if yq and isinstance(yq.get("price"), (int, float)):
+                closes = [float(yq.get("price"))]
 
     last_close = closes[-1] if closes else None
     tr: List[float] = []
@@ -236,10 +246,13 @@ def symbol_snapshot(
         except Exception:
             volume = None
     else:
-        yq = _yf_quote(symbol)
-        if yq:
-            pct_change = yq.get("pctChange")
-            volume = yq.get("volume")
+        # Yahoo quote backup; for VIX use VIXY then ^VIX
+        for yf_sym in (["VIXY", "^VIX"] if symbol.upper() == "VIX" else [symbol]):
+            yq = _yf_quote(yf_sym)
+            if yq:
+                pct_change = yq.get("pctChange")
+                volume = yq.get("volume")
+                break
 
     return {
         "symbol": symbol,
