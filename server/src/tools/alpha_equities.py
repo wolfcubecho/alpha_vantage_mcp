@@ -12,6 +12,11 @@ import time
 from typing import Any, Dict, List, Optional
 
 import httpx
+try:
+    import yfinance as yf  # optional, improves Yahoo reliability
+    _HAS_YF = True
+except Exception:
+    _HAS_YF = False
 
 from src.tools.registry import tool
 from src.common import _make_api_request
@@ -79,6 +84,49 @@ def _yf_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
                         pass
                 time.sleep(0.3)
         return None
+    except Exception:
+        return None
+
+
+def _yfi_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
+    """Quote via yfinance (robust Yahoo wrapper). Computes pctChange from history.
+
+    Returns price, pctChange, volume when available.
+    """
+    if not _HAS_YF:
+        return None
+    try:
+        df = yf.download(symbol, period="5d", interval="1d", progress=False)
+        if df is None or df.empty:
+            return None
+        last = df.tail(1)
+        prev = df.tail(2).head(1)
+        price = float(last["Close"].iloc[0]) if "Close" in last.columns else None
+        volume = float(last["Volume"].iloc[0]) if "Volume" in last.columns else None
+        pct = None
+        if price is not None and not prev.empty and "Close" in prev.columns:
+            prev_close = float(prev["Close"].iloc[0])
+            if prev_close:
+                pct = (price - prev_close) / prev_close * 100.0
+        return {"price": price, "pctChange": pct, "volume": volume}
+    except Exception:
+        return None
+
+
+def _yfi_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
+    """Daily candles via yfinance (2y, 1d)."""
+    if not _HAS_YF:
+        return None
+    try:
+        df = yf.download(symbol, period="2y", interval="1d", progress=False)
+        if df is None or df.empty:
+            return None
+        closes = [float(x) for x in df["Close"].tolist()] if "Close" in df.columns else []
+        highs = [float(x) for x in df["High"].tolist()] if "High" in df.columns else []
+        lows = [float(x) for x in df["Low"].tolist()] if "Low" in df.columns else []
+        if not closes:
+            return None
+        return {"closes": closes, "highs": highs, "lows": lows}
     except Exception:
         return None
 
@@ -162,8 +210,22 @@ def macro_snapshot(
                 except Exception:
                     vol = None
             if price is None:
-                # Yahoo fallback; for VIX, prefer ^VIX, then VIXY ETF
-                yf_symbols = ["^VIX", "VIXY"] if vix_like else [used]
+                # yfinance preferred for VIX; then direct Yahoo
+                if vix_like:
+                    yq = _yfi_quote("^VIX") or _yfi_quote("VIXY")
+                    if yq:
+                        price = yq.get("price")
+                        pct = yq.get("pctChange")
+                        vol = yq.get("volume")
+                if price is None:
+                    yf_symbols = ["^VIX", "VIXY"] if vix_like else [used]
+                    for yf_sym in yf_symbols:
+                        yq = _yf_quote(yf_sym)
+                        if yq:
+                            price = yq.get("price")
+                            pct = yq.get("pctChange")
+                            vol = yq.get("volume")
+                            break
                 for yf_sym in yf_symbols:
                     yq = _yf_quote(yf_sym)
                     if yq:
@@ -220,8 +282,16 @@ def symbol_snapshot(
     highs = [float(series[d]["2. high"]) for d in dates] if dates else []
     lows = [float(series[d]["3. low"]) for d in dates] if dates else []
     if not closes:
-        # Try Yahoo daily candles; for VIX prefer ^VIX, then VIXY
-        fallback_syms = ["^VIX", "VIXY"] if vix_like else [symbol]
+        # Try yfinance daily first for VIX; then direct Yahoo
+        if vix_like:
+            yf = _yfi_daily("^VIX") or _yfi_daily("VIXY")
+            if yf:
+                closes = yf["closes"]
+                highs = yf["highs"]
+                lows = yf["lows"]
+        # If still no, try direct Yahoo
+        if not closes:
+            fallback_syms = ["^VIX", "VIXY"] if vix_like else [symbol]
         for fs in fallback_syms:
             yf = _yf_daily(fs)
             if yf:
@@ -231,7 +301,7 @@ def symbol_snapshot(
                 break
         # If still no candles, at least use Yahoo quote for last price
         if not closes:
-            yq = _yf_quote(fallback_syms[0])
+            yq = _yfi_quote(fallback_syms[0]) or _yf_quote(fallback_syms[0])
             if yq and isinstance(yq.get("price"), (int, float)):
                 closes = [float(yq.get("price"))]
 
@@ -273,9 +343,9 @@ def symbol_snapshot(
         except Exception:
             volume = None
     else:
-        # Yahoo quote backup; for VIX prefer ^VIX then VIXY
+        # Yahoo backups; prefer yfinance first, then direct Yahoo
         for yf_sym in (["^VIX", "VIXY"] if vix_like else [symbol]):
-            yq = _yf_quote(yf_sym)
+            yq = _yfi_quote(yf_sym) or _yf_quote(yf_sym)
             if yq:
                 pct_change = yq.get("pctChange")
                 volume = yq.get("volume")
