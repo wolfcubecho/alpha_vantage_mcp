@@ -8,6 +8,7 @@ fallbacks when AV is unavailable or rate-limited.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -27,22 +28,27 @@ def _yf_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
         url = "https://query1.finance.yahoo.com/v7/finance/quote"
         params = {"symbols": symbol}
         with httpx.Client(timeout=10) as client:
-            res = client.get(url, params=params)
-            if res.status_code != 200:
-                return None
-            json = res.json()
-        arr = (json.get("quoteResponse", {}) or {}).get("result", [])
-        q = arr[0] if arr else None
-        if not q:
-            return None
-        price = q.get("regularMarketPrice")
-        pct = q.get("regularMarketChangePercent")
-        vol = q.get("regularMarketVolume")
-        return {
-            "price": float(price) if isinstance(price, (int, float)) else None,
-            "pctChange": float(pct) if isinstance(pct, (int, float)) else None,
-            "volume": float(vol) if isinstance(vol, (int, float)) else None,
-        }
+            for _ in range(3):
+                res = client.get(url, params=params)
+                if res.status_code == 200:
+                    try:
+                        json = res.json()
+                        arr = (json.get("quoteResponse", {}) or {}).get("result", [])
+                        q = arr[0] if arr else None
+                        if not q:
+                            raise ValueError("empty quote result")
+                        price = q.get("regularMarketPrice")
+                        pct = q.get("regularMarketChangePercent")
+                        vol = q.get("regularMarketVolume")
+                        return {
+                            "price": float(price) if isinstance(price, (int, float)) else None,
+                            "pctChange": float(pct) if isinstance(pct, (int, float)) else None,
+                            "volume": float(vol) if isinstance(vol, (int, float)) else None,
+                        }
+                    except Exception:
+                        pass
+                time.sleep(0.3)
+        return None
     except Exception:
         return None
 
@@ -53,21 +59,26 @@ def _yf_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
         base = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {"range": "2y", "interval": "1d"}
         with httpx.Client(timeout=10) as client:
-            res = client.get(base, params=params)
-            if res.status_code != 200:
-                return None
-            data = res.json()
-        result = ((data or {}).get("chart", {}) or {}).get("result", [])
-        if not result:
-            return None
-        quote = (result[0].get("indicators", {}) or {}).get("quote", [])
-        q0 = quote[0] if quote else {}
-        closes = [float(v) for v in (q0.get("close") or []) if isinstance(v, (int, float))]
-        highs = [float(v) for v in (q0.get("high") or []) if isinstance(v, (int, float))]
-        lows = [float(v) for v in (q0.get("low") or []) if isinstance(v, (int, float))]
-        if not closes:
-            return None
-        return {"closes": closes, "highs": highs, "lows": lows}
+            for _ in range(3):
+                res = client.get(base, params=params)
+                if res.status_code == 200:
+                    try:
+                        data = res.json()
+                        result = ((data or {}).get("chart", {}) or {}).get("result", [])
+                        if not result:
+                            raise ValueError("empty chart result")
+                        quote = (result[0].get("indicators", {}) or {}).get("quote", [])
+                        q0 = quote[0] if quote else {}
+                        closes = [float(v) for v in (q0.get("close") or []) if isinstance(v, (int, float))]
+                        highs = [float(v) for v in (q0.get("high") or []) if isinstance(v, (int, float))]
+                        lows = [float(v) for v in (q0.get("low") or []) if isinstance(v, (int, float))]
+                        if not closes:
+                            raise ValueError("no closes")
+                        return {"closes": closes, "highs": highs, "lows": lows}
+                    except Exception:
+                        pass
+                time.sleep(0.3)
+        return None
     except Exception:
         return None
 
@@ -109,7 +120,7 @@ def macro_snapshot(
     Returns:
         Dict containing sector, movers, and per-symbol snapshot (price, pctChange, volume).
     """
-    syms = (symbols or "SPY,VIX,UUP").split(",")
+    syms = (symbols or "SPY,^VIX,UUP").split(",")
     syms = [s.strip() for s in syms if s.strip()][:3]
     want_sector = (includeSector or "false").lower() == "true"
     want_movers = (includeMovers or "false").lower() == "true"
@@ -120,9 +131,10 @@ def macro_snapshot(
     out: List[Dict[str, Optional[float]]] = []
     for sym in syms:
         try:
-            cand = ["VIX", "VIXY"] if sym.upper() == "VIX" else [sym]
+            vix_like = sym.upper() in ("VIX", "^VIX")
+            cand = ["VIXY"] if vix_like else [sym]
             used = sym
-            # Try Alpha Vantage GLOBAL_QUOTE first with VIX→VIXY fallback
+            # Try Alpha Vantage GLOBAL_QUOTE first (AV doesn't support ^VIX; use VIXY proxy)
             quote_json = None
             for s in cand:
                 q = _make_api_request("GLOBAL_QUOTE", {"symbol": s, "datatype": "json"})
@@ -150,8 +162,8 @@ def macro_snapshot(
                 except Exception:
                     vol = None
             if price is None:
-                # Yahoo fallback; for VIX, try VIXY then ^VIX
-                yf_symbols = ["VIXY", "^VIX"] if sym.upper() == "VIX" else [used]
+                # Yahoo fallback; for VIX, prefer ^VIX, then VIXY ETF
+                yf_symbols = ["^VIX", "VIXY"] if vix_like else [used]
                 for yf_sym in yf_symbols:
                     yq = _yf_quote(yf_sym)
                     if yq:
@@ -193,8 +205,14 @@ def symbol_snapshot(
     """
     outsize = outputsize or "compact"
 
-    daily = _make_api_request(
-        "TIME_SERIES_DAILY_ADJUSTED", {"symbol": symbol, "outputsize": outsize, "datatype": "json"}
+    # For VIX, skip AV daily (not supported) and use Yahoo first
+    vix_like = symbol.upper() in ("VIX", "^VIX")
+    daily = (
+        None
+        if vix_like
+        else _make_api_request(
+            "TIME_SERIES_DAILY_ADJUSTED", {"symbol": symbol, "outputsize": outsize, "datatype": "json"}
+        )
     )
     series = daily.get("Time Series (Daily)") if isinstance(daily, dict) else {}
     dates = sorted(series.keys()) if series else []
@@ -202,8 +220,8 @@ def symbol_snapshot(
     highs = [float(series[d]["2. high"]) for d in dates] if dates else []
     lows = [float(series[d]["3. low"]) for d in dates] if dates else []
     if not closes:
-        # Try Yahoo daily candles for VIX via VIXY or ^VIX; else the same symbol
-        fallback_syms = ["VIXY", "^VIX"] if symbol.upper() == "VIX" else [symbol]
+        # Try Yahoo daily candles; for VIX prefer ^VIX, then VIXY
+        fallback_syms = ["^VIX", "VIXY"] if vix_like else [symbol]
         for fs in fallback_syms:
             yf = _yf_daily(fs)
             if yf:
@@ -242,7 +260,7 @@ def symbol_snapshot(
 
     pct_change: Optional[float] = None
     volume: Optional[float] = None
-    quote = _make_api_request("GLOBAL_QUOTE", {"symbol": symbol, "datatype": "json"})
+    quote = None if vix_like else _make_api_request("GLOBAL_QUOTE", {"symbol": symbol, "datatype": "json"})
     q = quote.get("Global Quote") if isinstance(quote, dict) else None
     if q:
         try:
@@ -255,8 +273,8 @@ def symbol_snapshot(
         except Exception:
             volume = None
     else:
-        # Yahoo quote backup; for VIX use VIXY then ^VIX
-        for yf_sym in (["VIXY", "^VIX"] if symbol.upper() == "VIX" else [symbol]):
+        # Yahoo quote backup; for VIX prefer ^VIX then VIXY
+        for yf_sym in (["^VIX", "VIXY"] if vix_like else [symbol]):
             yq = _yf_quote(yf_sym)
             if yq:
                 pct_change = yq.get("pctChange")
