@@ -149,7 +149,9 @@ def macro_snapshot(
                 except Exception:
                     vol = None
             if price is None:
-                yq = _yf_quote(used)
+                # Yahoo fallback; for VIX, prefer VIXY which tracks VIX
+                yf_symbol = "VIXY" if sym.upper() == "VIX" else used
+                yq = _yf_quote(yf_symbol)
                 if yq:
                     price = yq.get("price")
                     pct = yq.get("pctChange")
