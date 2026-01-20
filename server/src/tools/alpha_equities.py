@@ -32,7 +32,11 @@ def _yf_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
     try:
         url = "https://query1.finance.yahoo.com/v7/finance/quote"
         params = {"symbols": symbol}
-        with httpx.Client(timeout=10) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+        }
+        with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
             for _ in range(3):
                 res = client.get(url, params=params)
                 if res.status_code == 200:
@@ -63,7 +67,11 @@ def _yf_daily(symbol: str) -> Optional[Dict[str, List[float]]]:
     try:
         base = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {"range": "2y", "interval": "1d"}
-        with httpx.Client(timeout=10) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+        }
+        with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
             for _ in range(3):
                 res = client.get(base, params=params)
                 if res.status_code == 200:
@@ -182,28 +190,30 @@ def macro_snapshot(
             vix_like = sym.upper() in ("VIX", "^VIX")
             used = sym
 
-            # 1) yfinance first
-            yq = None
-            if vix_like:
-                yq = _yfi_quote("^VIX") or _yfi_quote("VIXY")
-                used = "^VIX" if yq else used
-            else:
-                yq = _yfi_quote(sym)
-            price = yq.get("price") if yq else None
-            pct = yq.get("pctChange") if yq else None
-            vol = yq.get("volume") if yq else None
+            # 1) direct Yahoo first
+            price = None
+            pct = None
+            vol = None
+            yf_symbols = ["^VIX", "VIXY"] if vix_like else [sym]
+            for yf_sym in yf_symbols:
+                yq2 = _yf_quote(yf_sym)
+                if yq2:
+                    price = yq2.get("price")
+                    pct = yq2.get("pctChange")
+                    vol = yq2.get("volume")
+                    used = yf_sym
+                    break
 
-            # 2) direct Yahoo fallback
+            # 2) yfinance fallback
             if price is None:
-                yf_symbols = ["^VIX", "VIXY"] if vix_like else [sym]
-                for yf_sym in yf_symbols:
-                    yq2 = _yf_quote(yf_sym)
-                    if yq2:
-                        price = yq2.get("price")
-                        pct = yq2.get("pctChange")
-                        vol = yq2.get("volume")
-                        used = yf_sym
-                        break
+                if vix_like:
+                    yq = _yfi_quote("^VIX") or _yfi_quote("VIXY")
+                else:
+                    yq = _yfi_quote(sym)
+                if yq:
+                    price = yq.get("price")
+                    pct = yq.get("pctChange")
+                    vol = yq.get("volume")
 
             # 3) Alpha Vantage last (VIX via VIXY proxy)
             if price is None:
@@ -272,22 +282,22 @@ def symbol_snapshot(
     highs: List[float] = []
     lows: List[float] = []
 
-    # yfinance daily first
-    yfd = _yfi_daily("^VIX") or _yfi_daily("VIXY") if vix_like else _yfi_daily(symbol)
-    if yfd:
-        closes = yfd["closes"]
-        highs = yfd["highs"]
-        lows = yfd["lows"]
+    # direct Yahoo first
+    for fs in (["^VIX", "VIXY"] if vix_like else [symbol]):
+        yf = _yf_daily(fs)
+        if yf:
+            closes = yf["closes"]
+            highs = yf["highs"]
+            lows = yf["lows"]
+            break
 
-    # direct Yahoo next
+    # yfinance next
     if not closes:
-        for fs in (["^VIX", "VIXY"] if vix_like else [symbol]):
-            yf = _yf_daily(fs)
-            if yf:
-                closes = yf["closes"]
-                highs = yf["highs"]
-                lows = yf["lows"]
-                break
+        yfd = (_yfi_daily("^VIX") or _yfi_daily("VIXY")) if vix_like else _yfi_daily(symbol)
+        if yfd:
+            closes = yfd["closes"]
+            highs = yfd["highs"]
+            lows = yfd["lows"]
 
     # Alpha Vantage last (non-VIX only)
     if not closes and not vix_like:
