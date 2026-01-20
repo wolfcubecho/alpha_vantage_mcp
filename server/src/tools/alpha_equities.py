@@ -101,11 +101,11 @@ def _yfi_quote(symbol: str) -> Optional[Dict[str, Optional[float]]]:
             return None
         last = df.tail(1)
         prev = df.tail(2).head(1)
-        price = float(last["Close"].iloc[0]) if "Close" in last.columns else None
-        volume = float(last["Volume"].iloc[0]) if "Volume" in last.columns else None
+        price = float(last["Close"].to_numpy()[0]) if "Close" in last.columns else None
+        volume = float(last["Volume"].to_numpy()[0]) if "Volume" in last.columns else None
         pct = None
         if price is not None and not prev.empty and "Close" in prev.columns:
-            prev_close = float(prev["Close"].iloc[0])
+            prev_close = float(prev["Close"].to_numpy()[0])
             if prev_close:
                 pct = (price - prev_close) / prev_close * 100.0
         return {"price": price, "pctChange": pct, "volume": volume}
@@ -180,59 +180,58 @@ def macro_snapshot(
     for sym in syms:
         try:
             vix_like = sym.upper() in ("VIX", "^VIX")
-            cand = ["VIXY"] if vix_like else [sym]
             used = sym
-            # Try Alpha Vantage GLOBAL_QUOTE first (AV doesn't support ^VIX; use VIXY proxy)
-            quote_json = None
-            for s in cand:
-                q = _make_api_request("GLOBAL_QUOTE", {"symbol": s, "datatype": "json"})
-                qq = (q or {}).get("Global Quote") if isinstance(q, dict) else None
-                price = float(qq.get("05. price")) if qq and qq.get("05. price") else None
-                if price and not math.isnan(price):
-                    quote_json = qq
-                    used = s
-                    break
-            price = None
-            pct = None
-            vol = None
-            if quote_json:
-                try:
-                    price = float(quote_json.get("05. price"))
-                except Exception:
-                    price = None
-                try:
-                    pct_str = (quote_json.get("10. change percent") or "0").replace("%", "")
-                    pct = float(pct_str)
-                except Exception:
-                    pct = None
-                try:
-                    vol = float(quote_json.get("06. volume"))
-                except Exception:
-                    vol = None
+
+            # 1) yfinance first
+            yq = None
+            if vix_like:
+                yq = _yfi_quote("^VIX") or _yfi_quote("VIXY")
+                used = "^VIX" if yq else used
+            else:
+                yq = _yfi_quote(sym)
+            price = yq.get("price") if yq else None
+            pct = yq.get("pctChange") if yq else None
+            vol = yq.get("volume") if yq else None
+
+            # 2) direct Yahoo fallback
             if price is None:
-                # yfinance preferred for VIX; then direct Yahoo
-                if vix_like:
-                    yq = _yfi_quote("^VIX") or _yfi_quote("VIXY")
-                    if yq:
-                        price = yq.get("price")
-                        pct = yq.get("pctChange")
-                        vol = yq.get("volume")
-                if price is None:
-                    yf_symbols = ["^VIX", "VIXY"] if vix_like else [used]
-                    for yf_sym in yf_symbols:
-                        yq = _yf_quote(yf_sym)
-                        if yq:
-                            price = yq.get("price")
-                            pct = yq.get("pctChange")
-                            vol = yq.get("volume")
-                            break
+                yf_symbols = ["^VIX", "VIXY"] if vix_like else [sym]
                 for yf_sym in yf_symbols:
-                    yq = _yf_quote(yf_sym)
-                    if yq:
-                        price = yq.get("price")
-                        pct = yq.get("pctChange")
-                        vol = yq.get("volume")
+                    yq2 = _yf_quote(yf_sym)
+                    if yq2:
+                        price = yq2.get("price")
+                        pct = yq2.get("pctChange")
+                        vol = yq2.get("volume")
+                        used = yf_sym
                         break
+
+            # 3) Alpha Vantage last (VIX via VIXY proxy)
+            if price is None:
+                cand = ["VIXY"] if vix_like else [sym]
+                quote_json = None
+                for s in cand:
+                    q = _make_api_request("GLOBAL_QUOTE", {"symbol": s, "datatype": "json"})
+                    qq = (q or {}).get("Global Quote") if isinstance(q, dict) else None
+                    ptmp = float(qq.get("05. price")) if qq and qq.get("05. price") else None
+                    if ptmp and not math.isnan(ptmp):
+                        quote_json = qq
+                        used = s
+                        break
+                if quote_json:
+                    try:
+                        price = float(quote_json.get("05. price"))
+                    except Exception:
+                        price = None
+                    try:
+                        pct_str = (quote_json.get("10. change percent") or "0").replace("%", "")
+                        pct = float(pct_str)
+                    except Exception:
+                        pct = None
+                    try:
+                        vol = float(quote_json.get("06. volume"))
+                    except Exception:
+                        vol = None
+
             out.append({"symbol": used, "price": price, "pctChange": pct, "volume": vol})
         except Exception:
             out.append({"symbol": sym, "price": None, "pctChange": None, "volume": None})
