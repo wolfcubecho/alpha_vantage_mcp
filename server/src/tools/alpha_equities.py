@@ -98,6 +98,7 @@ def macro_snapshot(
     symbols: Optional[str] = None,
     includeSector: Optional[str] = None,
     includeMovers: Optional[str] = None,
+    noNulls: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Efficient macro snapshot with optional sector and movers.
 
@@ -162,6 +163,13 @@ def macro_snapshot(
         except Exception:
             out.append({"symbol": sym, "price": None, "pctChange": None, "volume": None})
 
+    # Coerce nulls if requested (default true)
+    if (noNulls or "true").lower() == "true":
+        for i in range(len(out)):
+            row = out[i]
+            row["price"] = float(row["price"]) if isinstance(row.get("price"), (int, float)) else 0.0
+            row["pctChange"] = float(row["pctChange"]) if isinstance(row.get("pctChange"), (int, float)) else 0.0
+            row["volume"] = float(row["volume"]) if isinstance(row.get("volume"), (int, float)) else 0.0
     return {"sector": sector, "movers": movers, "etfs": out}
 
 
@@ -171,6 +179,7 @@ def symbol_snapshot(
     outputsize: Optional[str] = None,
     atrPctMax: Optional[str] = None,
     trendFilter: Optional[str] = None,
+    noNulls: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Per-symbol snapshot: EMA(50/200), ATR% (14), latest quote.
 
@@ -254,7 +263,7 @@ def symbol_snapshot(
                 volume = yq.get("volume")
                 break
 
-    return {
+    result = {
         "symbol": symbol,
         "price": last_close,
         "pctChange": pct_change,
@@ -266,6 +275,17 @@ def symbol_snapshot(
         "hint": hint,
     }
 
+    # Coerce nulls if requested (default true)
+    if (noNulls or "true").lower() == "true":
+        result["price"] = float(result["price"]) if isinstance(result.get("price"), (int, float)) else 0.0
+        result["pctChange"] = float(result["pctChange"]) if isinstance(result.get("pctChange"), (int, float)) else 0.0
+        result["volume"] = float(result["volume"]) if isinstance(result.get("volume"), (int, float)) else 0.0
+        result["atrPct"] = float(result["atrPct"]) if isinstance(result.get("atrPct"), (int, float)) else 0.0
+        result["ema50"] = float(result["ema50"]) if isinstance(result.get("ema50"), (int, float)) else 0.0
+        result["ema200"] = float(result["ema200"]) if isinstance(result.get("ema200"), (int, float)) else 0.0
+        result["trend"] = result["trend"] if isinstance(result.get("trend"), str) and result["trend"] else "unknown"
+    return result
+
 
 @tool
 def discover_equities(
@@ -275,6 +295,7 @@ def discover_equities(
     maxSymbols: Optional[str] = None,
     computeVolatility: Optional[str] = None,
     outputsize: Optional[str] = None,
+    noNulls: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Discover top equities from Alpha Vantage movers with ranking.
 
@@ -403,4 +424,12 @@ def discover_equities(
 
         out.sort(key=_sort_key)
 
+    # Coerce nulls if requested (default true)
+    if (noNulls or "true").lower() == "true":
+        for i in range(len(out)):
+            row = out[i]
+            row["price"] = float(row["price"]) if isinstance(row.get("price"), (int, float)) else 0.0
+            row["pctChange"] = float(row["pctChange"]) if isinstance(row.get("pctChange"), (int, float)) else 0.0
+            row["volume"] = float(row["volume"]) if isinstance(row.get("volume"), (int, float)) else 0.0
+            row["atrPct"] = float(row["atrPct"]) if isinstance(row.get("atrPct"), (int, float)) else 0.0
     return out
